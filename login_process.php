@@ -1,63 +1,73 @@
 <?php
-session_start();
-include "database/db_conn.php";
+require_once 'config/session.php';
+require_once 'config/database.php';
+require_once 'includes/security.php';
+
+setSecurityHeaders();
 
 if (isset($_POST['uname']) && isset($_POST['password']) && isset($_POST['csrf_token'])) {
 
-	// Validate CSRF token
-	if ($_POST['csrf_token'] !== $_SESSION['csrf_token']) {
-		header("Location: login.php?error=Invalid CSRF token");
-		exit();
-	}
+    if (!validateCsrfToken($_POST['csrf_token'])) {
+        header("Location: login.php?error=Invalid CSRF token");
+        exit();
+    }
 
-	function validate($data)
-	{
-		$data = trim($data);
-		$data = stripslashes($data);
-		$data = htmlspecialchars($data);
-		return $data;
-	}
+    if (isRateLimited('login_attempts', 5, 900)) {
+        header("Location: login.php?error=Too many login attempts. Please try again in 15 minutes.");
+        exit();
+    }
 
-	$uname = validate(htmlspecialchars($_POST['uname']));
-	$pass = validate(htmlspecialchars($_POST['password']));
+    $uname = sanitizeInput($_POST['uname']);
+    $pass  = sanitizeInput($_POST['password']);
 
-	if (empty($uname)) {
-		header("Location: login.php?error=User Name is required");
-		exit();
-	} else if (empty($pass)) {
-		header("Location: login.php?error=Password is required");
-		exit();
-	} else {
-		// hashing the password
-		$pass = md5($pass);
+    if (empty($uname)) {
+        header("Location: login.php?error=User Name is required");
+        exit();
+    } elseif (empty($pass)) {
+        header("Location: login.php?error=Password is required");
+        exit();
+    } else {
+        $stmt = $conn->prepare("SELECT * FROM users WHERE user_name=?");
+        $stmt->bind_param("s", $uname);
+        $stmt->execute();
+        $result = $stmt->get_result();
 
-		// Use prepared statement with placeholders
-		$stmt = $conn->prepare("SELECT * FROM users WHERE user_name=? AND password=?");
-		$stmt->bind_param("ss", $uname, $pass);
-		$stmt->execute();
-		$result = $stmt->get_result();
+        if ($result->num_rows === 1) {
+            $row = $result->fetch_assoc();
 
-		if ($result->num_rows === 1) {
-			$row = mysqli_fetch_assoc($result);
-			if ($row['user_name'] === $uname && $row['password'] === $pass) {
-				$_SESSION['user_name'] = $row['user_name'];
-				$_SESSION['name'] = $row['name'];
-				$_SESSION['id'] = $row['id'];
+            // Support both legacy MD5 and new bcrypt hashes
+            $passwordMatch = false;
+            if (password_get_info($row['password'])['algo'] !== null && password_get_info($row['password'])['algo'] !== 0) {
+                $passwordMatch = password_verify($pass, $row['password']);
+            } else {
+                $passwordMatch = (md5($pass) === $row['password']);
+                if ($passwordMatch) {
+                    $newHash = password_hash($pass, PASSWORD_BCRYPT);
+                    $updateStmt = $conn->prepare("UPDATE users SET password=? WHERE id=?");
+                    $updateStmt->bind_param("si", $newHash, $row['id']);
+                    $updateStmt->execute();
+                }
+            }
 
-				session_regenerate_id(true);
-
-				header("Location: mfa.php");
-				exit();
-			} else {
-				header("Location: login.php?error=Incorect User name or password");
-				exit();
-			}
-		} else {
-			header("Location: login.php?error=Incorect User name or password");
-			exit();
-		}
-	}
+            if ($passwordMatch) {
+                $_SESSION['user_name'] = $row['user_name'];
+                $_SESSION['name'] = $row['name'];
+                $_SESSION['id'] = $row['id'];
+                session_regenerate_id(true);
+                header("Location: mfa.php");
+                exit();
+            } else {
+                recordAttempt('login_attempts');
+                header("Location: login.php?error=Incorrect User name or password");
+                exit();
+            }
+        } else {
+            recordAttempt('login_attempts');
+            header("Location: login.php?error=Incorrect User name or password");
+            exit();
+        }
+    }
 } else {
-	header("Location: login.php");
-	exit();
+    header("Location: login.php");
+    exit();
 }

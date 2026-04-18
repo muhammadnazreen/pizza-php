@@ -1,91 +1,72 @@
 <?php
-session_start();
-include "database/db_conn.php";
+require_once 'config/session.php';
+require_once 'config/database.php';
+require_once 'includes/security.php';
+
+setSecurityHeaders();
 
 if (isset($_POST['uname']) && isset($_POST['np']) && isset($_POST['c_np']) && isset($_POST['csrf_token'])) {
 
-	// Validate CSRF token
-    if (!strcmp($_POST['csrf_token'],$_SESSION['csrf_token'])) {
-        header("Location: recover.php?error=Invalid CSRF token");
-        exit();
+    if (!validateCsrfToken($_POST['csrf_token'])) {
+        header("Location: recover.php?error=Invalid CSRF token"); exit();
     }
 
-	function validate($data)
-	{
-		$data = trim($data);
-		$data = stripslashes($data);
-		$data = htmlspecialchars($data);
-		return $data;
-	}
+    $uname = sanitizeInput($_POST['uname']);
+    $np    = sanitizeInput($_POST['np']);
+    $c_np  = sanitizeInput($_POST['c_np']);
 
-	function validatePassword($password, $user_data)
-	{
-		// Minimum eight characters, at least one uppercase letter, one lowercase letter, one number, and one special character
-		$pattern = "/^(?=.*[A-Z])(?=.*[a-z])(?=.*\d)(?=.*[^A-Za-z\d\s]).{8,}$/";
+    if (empty($uname)) {
+        header("Location: recover.php?error=User Name is required"); exit();
+    } elseif (empty($np)) {
+        header("Location: recover.php?error=New Password is required"); exit();
+    } elseif ($np !== $c_np) {
+        header("Location: recover.php?error=The confirmation password does not match"); exit();
+    } else {
+        if (!validatePassword($np)) {
+            header("Location: recover.php?error=Invalid password. Must be 8+ chars with uppercase, lowercase, number, and special character");
+            exit();
+        }
 
-		// Perform the validation
-		if (preg_match($pattern, $password)) {
-			return $password; // Password meets the requirements
-		} else {
-			// Password does not meet the requirements
-			header("Location: recover.php?error=Invalid password. Password must be at least 8 characters long and include at least 1 uppercase letter, 1 lowercase letter, 1 number, and 1 special character");
-			exit();
-		}
-	}
+        $hashedPassword = password_hash($np, PASSWORD_BCRYPT);
 
-	$uname = validate(htmlspecialchars($_POST['uname']));
-	$np = validate(htmlspecialchars($_POST['np']));
-	$c_np = validate(htmlspecialchars($_POST['c_np']));
+        $stmt = $conn->prepare("SELECT * FROM users WHERE user_name=?");
+        $stmt->bind_param("s", $uname);
+        $stmt->execute();
+        $result = $stmt->get_result();
 
-	if (empty($uname)) {
-		header("Location: recover.php?error=User Name is required");
-		exit();
-	} else if (empty($np)) {
-		header("Location: recover.php?error=New Password is required");
-		exit();
-	} else if ($np !== $c_np) {
-		header("Location: recover.php?error=The confirmation password does not match");
-		exit();
-	} else {
-		$np = validatePassword($np, $user_data);
-		// Hashing the password
-		$np = md5($np);
+        if ($result->num_rows === 1) {
+            $row = $result->fetch_assoc();
+            $secretQuestion        = $row['secret_question'];
+            $encryptedSecretAnswer = $row['secret_answer'];
+            $encryptionKey         = $row['encryption_key'];
+            $ciphering_value       = 'AES-256-CBC';
 
-		// Use prepared statement to retrieve user data including secret question and answer
-		$stmt = $conn->prepare("SELECT * FROM users WHERE user_name=?");
-		$stmt->bind_param("s", $uname);
-		$stmt->execute();
-		$result = $stmt->get_result();
+            $secretAnswer_db = '';
+            $decoded = base64_decode($encryptedSecretAnswer);
+            $ivLength = openssl_cipher_iv_length($ciphering_value);
 
-		if ($result->num_rows === 1) {
-			$row = $result->fetch_assoc();
-			$secretQuestion = $row['secret_question'];
-			$encryptedSecretAnswer = $row['secret_answer'];
-			$encryptionKey = $row['encryption_key'];
-			$ciphering_value = 'AES-256-CBC';
+            if (strlen($decoded) > $ivLength) {
+                $iv = substr($decoded, 0, $ivLength);
+                $encrypted = substr($decoded, $ivLength);
+                $secretAnswer_db = openssl_decrypt($encrypted, $ciphering_value, $encryptionKey, OPENSSL_RAW_DATA, $iv);
+            }
 
-			// Decrypt the secret answer using AES-256 decryption
-			$secretAnswer = openssl_decrypt($encryptedSecretAnswer, $ciphering_value, $encryptionKey);
+            if (empty($secretAnswer_db)) {
+                $secretAnswer_db = openssl_decrypt($encryptedSecretAnswer, $ciphering_value, $encryptionKey);
+            }
 
-			if ($_POST['secret_question'] === $secretQuestion && $_POST['secret_answer'] === $secretAnswer) {
-				// Use prepared statement to update the password
-				$updateStmt = $conn->prepare("UPDATE users SET password=? WHERE user_name=?");
-				$updateStmt->bind_param("ss", $np, $uname);
-				$updateStmt->execute();
-
-				header("Location: recover.php?success=Your password has been changed successfully");
-				exit();
-			} else {
-
-				header("Location: recover.php?error=Incorrect secret question or answer");
-				exit();
-			}
-		} else {
-			header("Location: recover.php?error=Incorrect username");
-			exit();
-		}
-	}
+            if ($_POST['secret_question'] === $secretQuestion && $_POST['secret_answer'] === $secretAnswer_db) {
+                $updateStmt = $conn->prepare("UPDATE users SET password=? WHERE user_name=?");
+                $updateStmt->bind_param("ss", $hashedPassword, $uname);
+                $updateStmt->execute();
+                header("Location: recover.php?success=Your password has been changed successfully"); exit();
+            } else {
+                header("Location: recover.php?error=Incorrect secret question or answer"); exit();
+            }
+        } else {
+            header("Location: recover.php?error=Incorrect username"); exit();
+        }
+    }
 } else {
-	header("Location: recover.php");
-	exit();
+    header("Location: recover.php"); exit();
 }
